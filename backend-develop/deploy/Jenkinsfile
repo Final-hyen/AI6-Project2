@@ -1,0 +1,79 @@
+pipeline {
+    agent any
+
+    environment {
+        /* Jenkins credentials */
+        AWS_CREDENTIAL_ID = 'ecr-user'
+        VM_ENTER_CREDENTIAL_ID = 'enter-vm-credential' // elice VM에 접속하기 위한 credential
+        OSONDOSON_VM_CREDENTIAL_ID = 'osondoson-vm-credential' // VM 자체에 대한 credential (사용자 이름, 패스워드)
+
+        /* AWS Info */
+        ACCOUNT_ID = '014276069644'
+        REGION = 'ap-northeast-2'
+        ECR_REPO = '014276069644.dkr.ecr.ap-northeast-2.amazonaws.com/osondoson-backend'
+
+        /* VM Info */
+        TARGET_HOST = '34.64.144.19'
+
+        /* Container Info */
+        CONTAINER_NAME = 'osondoson-backend'
+        CONTAINER_PORT = 3500
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                deleteDir() // 이전에 가져온 소스 코드를 모두 삭제
+                checkout scm
+                sh 'git checkout develop'
+            }
+        }
+
+        stage('Append .env file') {
+            steps {
+                withCredentials([file(credentialsId: 'osondoson-backend-env', variable: 'DOTENV_FILE')]) {
+                    sh "cat ${DOTENV_FILE} >> .env"
+                }
+            }
+        }
+
+        stage('Docker build') {
+            steps {
+                sh "docker build -t ${ECR_REPO}:latest ."
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                script {
+                    // docker push
+                    docker.withRegistry("https://${ECR_REPO}", "ecr:${REGION}:${AWS_CREDENTIAL_ID}") {
+                        docker.image("${ECR_REPO}:latest").push()
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to VM') {
+            steps {
+                script {
+                    sshagent(credentials: ["${VM_ENTER_CREDENTIAL_ID}"]) {
+                        withCredentials([usernamePassword(credentialsId: "${OSONDOSON_VM_CREDENTIAL_ID}", passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                            sh """
+                                ssh -o StrictHostKeyChecking=no ${USERNAME}@${TARGET_HOST} '
+                                    sudo chmod 777 /var/run/docker.sock
+                                    aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.ap-northeast-2.amazonaws.com/
+                                    docker pull ${ECR_REPO}:latest
+                                    if [[ \$(docker ps -a --filter name=${CONTAINER_NAME} --format "{{.Names}}") == ${CONTAINER_NAME} ]]; then
+                                        docker stop ${CONTAINER_NAME} && docker rm ${CONTAINER_NAME}
+                                    fi
+                                    docker run -d -p ${CONTAINER_PORT}:${CONTAINER_PORT} --name ${CONTAINER_NAME} ${ECR_REPO}:latest
+                                '
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
